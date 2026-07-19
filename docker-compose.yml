@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: command
+      POSTGRES_PASSWORD: command
+      POSTGRES_DB: command_ai
+    volumes:
+      - command-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U command -d command_ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: 4173
+      DATABASE_URL: postgresql://command:command@postgres:5432/command_ai
+      DATABASE_SSL: "false"
+      COOKIE_SECURE: "false"
+      AUTO_MIGRATE: "true"
+    ports:
+      - "4173:4173"
+
+volumes:
+  command-postgres:

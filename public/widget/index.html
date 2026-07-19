@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AI Assistant</title>
+  <link rel="stylesheet" href="/widget/widget.css">
+</head>
+<body>
+  <main class="widget" id="widget">
+    <header><span id="mark">AI</span><div><strong id="agentName">AI Assistant</strong><small id="businessName">Loading…</small></div><i></i></header>
+    <section id="messages" aria-live="polite"></section>
+    <form id="composer"><textarea name="message" rows="1" maxlength="5000" placeholder="Type your message…" aria-label="Message" required></textarea><button aria-label="Send">➤</button></form>
+    <footer>AI can make mistakes. Urgent matters may be transferred to a person.</footer>
+  </main>
+  <script type="module" src="/widget/widget-app.js"></script>
+</body>
+</html>

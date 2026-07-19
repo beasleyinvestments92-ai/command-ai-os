@@ -1,0 +1,120 @@
+import express from 'express';
+import multer from 'multer';
+import pdf from 'pdf-parse';
+import { z } from 'zod';
+import { config } from '../config.js';
+import { many, one, query, tx } from '../db/index.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
+import { rateLimit } from '../middleware/rate-limit.js';
+import { auditLog } from '../services/audit-log.js';
+import * as serialize from '../services/serializers.js';
+import { asyncRoute, HttpError } from '../utils/http.js';
+import { id, token } from '../utils/ids.js';
+import { cleanText, normalizeEmail, normalizePhone, checksum } from '../utils/text.js';
+import { createKnowledgeDocument, reindexMissingEmbeddings } from '../ai/knowledge.js';
+import { runAgent } from '../ai/orchestrator.js';
+import { getHighLevelConfigSummary, saveHighLevelConfig, testHighLevel } from '../integrations/highlevel.js';
+import { createClientCheckout, createClientPortal, stripeConfigured } from '../integrations/stripe.js';
+
+export const coreRouter = express.Router();
+coreRouter.use(requireAuth);
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: config.limits.uploadBytes, files: 1 } });
+const agentRateLimit = rateLimit({ windowMs: 60_000, max: config.limits.conversationsPerMinute, key: (req) => `agent:${req.auth.tenant.id}:${req.ip}` });
+
+function parse(schema, value) {
+  const result = schema.safeParse(value);
+  if (!result.success) throw new HttpError(400, 'Request validation failed.', result.error.flatten());
+  return result.data;
+}
+
+async function tenant(req) {
+  const row = await one('SELECT * FROM tenants WHERE id=$1', [req.auth.tenant.id]);
+  if (!row) throw new HttpError(404, 'Workspace not found.');
+  return row;
+}
+
+async function bootstrapPayload(req) {
+  const tenantRow = await tenant(req);
+  const [prospectRows, clientRows, agentRows, conversationRows, documents, integrations] = await Promise.all([
+    many('SELECT * FROM prospects WHERE tenant_id=$1 ORDER BY created_at DESC', [tenantRow.id]),
+    many('SELECT * FROM clients WHERE tenant_id=$1 ORDER BY created_at DESC', [tenantRow.id]),
+    many('SELECT * FROM agents WHERE tenant_id=$1 ORDER BY created_at DESC', [tenantRow.id]),
+    many('SELECT * FROM conversations WHERE tenant_id=$1 ORDER BY updated_at DESC LIMIT 100', [tenantRow.id]),
+    many(`SELECT kd.id,kd.client_id,kd.agent_id,kd.title,kd.source_type,kd.source_url,kd.status,kd.created_at,kd.updated_at,count(kc.id)::int AS chunks
+          FROM knowledge_documents kd LEFT JOIN knowledge_chunks kc ON kc.document_id=kd.id WHERE kd.tenant_id=$1
+          GROUP BY kd.id ORDER BY kd.updated_at DESC`, [tenantRow.id]),
+    many('SELECT provider,status,metadata,updated_at FROM integrations WHERE tenant_id=$1', [tenantRow.id])
+  ]);
+  const conversations = [];
+  for (const row of conversationRows) conversations.push(await serialize.conversation(row));
+  return {
+    user: req.auth.user,
+    tenant: req.auth.tenant,
+    csrfToken: req.auth.csrfToken,
+    dashboard: await serialize.dashboard(tenantRow.id, tenantRow),
+    brand: tenantRow.brand,
+    prospects: prospectRows.map(serialize.prospect),
+    clients: clientRows.map(serialize.client),
+    agents: agentRows.map(serialize.agent),
+    conversations,
+    knowledgeDocuments: documents.map((row) => ({ id: row.id, clientId: row.client_id, agentId: row.agent_id, title: row.title, sourceType: row.source_type, sourceUrl: row.source_url, status: row.status, chunks: row.chunks, createdAt: row.created_at, updatedAt: row.updated_at })),
+    integrations,
+    settings: tenantRow.settings
+  };
+}
+
+coreRouter.get('/bootstrap', asyncRoute(async (req, res) => res.json(await bootstrapPayload(req))));
+coreRouter.get('/dashboard', asyncRoute(async (req, res) => { const row = await tenant(req); res.json(await serialize.dashboard(row.id, row)); }));
+
+coreRouter.get('/release-readiness', asyncRoute(async (req, res) => {
+  const row = await tenant(req);
+  const clients = await one(`SELECT count(*)::int AS total, count(*) FILTER (WHERE status='Live')::int AS live FROM clients WHERE tenant_id=$1`, [row.id]);
+  const agents = await one(`SELECT count(*)::int AS total, count(*) FILTER (WHERE status='Active')::int AS active FROM agents WHERE tenant_id=$1`, [row.id]);
+  const docs = await one(`SELECT count(*)::int AS total FROM knowledge_documents WHERE tenant_id=$1 AND status='ready'`, [row.id]);
+  const checks = [
+    { key: 'database', label: 'PostgreSQL database', ready: true },
+    { key: 'authentication', label: 'Secure authentication and tenant isolation', ready: true },
+    { key: 'openai', label: 'OpenAI grounded agent', ready: Boolean(config.openai.apiKey) && row.settings?.simulationMode !== true },
+    { key: 'knowledge', label: 'Approved knowledge base', ready: Number(docs.total) > 0 },
+    { key: 'agents', label: 'At least one active agent', ready: Number(agents.active) > 0 },
+    { key: 'clients', label: 'At least one live client', ready: Number(clients.live) > 0 },
+    { key: 'twilio', label: 'Voice and SMS provider', ready: Boolean(config.twilio.accountSid && config.twilio.authToken) },
+    { key: 'stripe', label: 'Subscription billing', ready: stripeConfigured() },
+    { key: 'highlevel', label: 'HighLevel CRM sync', ready: (await getHighLevelConfigSummary(row.id)).configured },
+    { key: 'productionUrl', label: 'HTTPS production URL', ready: config.appUrl.startsWith('https://') },
+    { key: 'encryption', label: 'Integration secret encryption', ready: Boolean(config.integrationEncryptionKey) }
+  ];
+  res.json({ ready: checks.every((check) => check.ready || ['highlevel'].includes(check.key)), checks, mode: row.settings?.simulationMode ? 'simulation' : 'live' });
+}));
+
+const prospectSchema = z.object({
+  businessName: z.string().min(1).max(120), industry: z.string().max(80).default('Local Service'), city: z.string().max(100).optional().default(''),
+  website: z.string().max(500).optional().default(''), phone: z.string().max(40).optional().default(''), email: z.string().max(320).optional().default('')
+});
+
+coreRouter.get('/prospects', asyncRoute(async (req, res) => {
+  const rows = await many('SELECT * FROM prospects WHERE tenant_id=$1 ORDER BY created_at DESC', [req.auth.tenant.id]);
+  res.json({ prospects: rows.map(serialize.prospect) });
+}));
+
+coreRouter.post('/prospects', requireRole('owner','admin','member'), asyncRoute(async (req, res) => {
+  const body = parse(prospectSchema, req.body);
+  const row = await one(`INSERT INTO prospects(id,tenant_id,business_name,industry,city,website,phone,email)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`, [id('pros'), req.auth.tenant.id, cleanText(body.businessName,120), cleanText(body.industry,80), cleanText(body.city,100), cleanText(body.website,500), normalizePhone(body.phone), normalizeEmail(body.email)]);
+  await auditLog(req, 'prospect.created', 'prospect', row.id, { businessName: row.business_name });
+  res.status(201).json({ prospect: serialize.prospect(row) });
+}));
+
+coreRouter.post('/prospects/:id/audit', asyncRoute(async (req, res) => {
+  const row = await one('SELECT * FROM prospects WHERE id=$1 AND tenant_id=$2', [req.params.id, req.auth.tenant.id]);
+  if (!row) throw new HttpError(404, 'Prospect not found.');
+  const website = row.website || '';
+  const signals = {
+    websitePresent: Boolean(website), bookingFriction: website ? 'Medium' : 'High', missedCallRisk: ['Plumbing','HVAC','Roofing','Restoration','Electrical'].some((name) => row.industry.toLowerCase().includes(name.toLowerCase())) ? 'High' : 'Medium',
+    afterHoursCoverage: 'Unknown', reviewOpportunity: 'Medium', recommendedAutomation: ['24/7 receptionist','missed-call recovery','appointment booking','estimate follow-up']
+  };
+  let score = 50 + (signals.missedCallRisk === 'High' ? 18 : 8) + (!website ? 12 : 4) + (row.phone ? 4 : 0) + (row.email ? 4 : 0);
+  score = Math.min(96, score);
+  const estimated = Math.round((score / 100) * (signals.missedCallRisk === 'High' ? 6500 : 3500));
+  const updated = await one

@@ -1,0 +1,37 @@
+    monthly_price:req.body.monthlyPrice ?? current.monthly_price, status:req.body.status ?? current.status, launch_progress:req.body.launchProgress ?? current.launch_progress,
+    phone:req.body.phone!==undefined?normalizePhone(req.body.phone):current.phone, email:req.body.email!==undefined?normalizeEmail(req.body.email):current.email,
+    website:req.body.website ?? current.website, timezone:req.body.timezone ?? current.timezone, business_hours:req.body.businessHours ?? current.business_hours,
+    emergency_rules:req.body.emergencyRules ?? current.emergency_rules
+  };
+  const row=await one(`UPDATE clients SET business_name=$1,industry=$2,plan=$3,monthly_price=$4,status=$5,launch_progress=$6,phone=$7,email=$8,website=$9,timezone=$10,business_hours=$11,emergency_rules=$12,updated_at=now() WHERE id=$13 RETURNING *`,[data.business_name,data.industry,data.plan,data.monthly_price,data.status,data.launch_progress,data.phone,data.email,data.website,data.timezone,JSON.stringify(data.business_hours),JSON.stringify(data.emergency_rules),current.id]);
+  await auditLog(req,'client.updated','client',row.id);
+  res.json({client:serialize.client(row)});
+}));
+
+coreRouter.post('/clients/:id/launch', asyncRoute(async (req,res)=>{
+  const clientRow=await one('SELECT * FROM clients WHERE id=$1 AND tenant_id=$2',[req.params.id,req.auth.tenant.id]);
+  if(!clientRow) throw new HttpError(404,'Client not found.');
+  const result=await tx(async(db)=>{
+    const updated=await db.query(`UPDATE clients SET status=$1,launch_progress=$2,updated_at=now() WHERE id=$3 RETURNING *`,[req.body.goLive===false?'Onboarding':'Live',req.body.goLive===false?Number(req.body.progress||75):100,clientRow.id]).then(r=>r.rows[0]);
+    let agentRow=await db.query('SELECT * FROM agents WHERE client_id=$1 ORDER BY created_at LIMIT 1',[clientRow.id]).then(r=>r.rows[0]);
+    if(!agentRow){
+      agentRow=await db.query(`INSERT INTO agents(id,tenant_id,client_id,name,role,status,model,tone,objective,guardrails,greeting,handoff_number,channels,widget_token,settings)
+        VALUES($1,$2,$3,$4,'24/7 AI Receptionist',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,[
+        id('agent'),req.auth.tenant.id,clientRow.id,cleanText(req.body.agentName||'Atlas',60),updated.status==='Live'?'Active':'Draft',config.openai.model,
+        cleanText(req.body.tone||'Professional, natural, clear, and helpful.',300),cleanText(req.body.objective||'Answer approved questions, capture leads, book appointments, and escalate uncertain or urgent matters.',1000),
+        cleanText(req.body.guardrails||'Never invent prices or availability. Use tools before claiming actions. Escalate emergencies and low-confidence answers.',2000),cleanText(req.body.greeting||`Thank you for calling ${clientRow.business_name}. How can I help?`,500),
+        cleanText(req.body.handoffNumber||clientRow.phone,40),JSON.stringify(['Voice','SMS','Web Chat']),token(24),JSON.stringify({minimumConfidence:0.7,allowBooking:true,allowHandoff:true})
+      ]).then(r=>r.rows[0]);
+    }else if(updated.status==='Live') agentRow=await db.query(`UPDATE agents SET status='Active',updated_at=now() WHERE id=$1 RETURNING *`,[agentRow.id]).then(r=>r.rows[0]);
+    return {updated,agentRow};
+  });
+  if(req.body.knowledge){
+    await createKnowledgeDocument({tenantId:req.auth.tenant.id,clientId:clientRow.id,agentId:result.agentRow.id,title:'Launch knowledge',content:req.body.knowledge});
+  }
+  await auditLog(req,'client.launched','client',clientRow.id,{agentId:result.agentRow.id});
+  res.json({client:serialize.client(result.updated),agent:serialize.agent(result.agentRow)});
+}));
+
+coreRouter.get('/agents', asyncRoute(async(req,res)=>res.json({agents:(await many('SELECT * FROM agents WHERE tenant_id=$1 ORDER BY created_at DESC',[req.auth.tenant.id])).map(serialize.agent)})));
+coreRouter.post('/agents', asyncRoute(async(req,res)=>{
+  const clientRow=await one('SELECT * FROM clients WHERE id=$1 AND tenant_id=$2',[req.body.clientId,req.auth.tenant.id]);
