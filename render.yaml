@@ -10,6 +10,7 @@ services:
     name: command-ai-os
     runtime: node
     plan: starter
+    branch: release/v1
     buildCommand: node scripts/materialize-source.cjs && npm install --no-audit --no-fund
     preDeployCommand: npm run migrate
     startCommand: npm start
