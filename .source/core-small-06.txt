@@ -1,0 +1,39 @@
+  await query(`INSERT INTO messages(id,tenant_id,conversation_id,role,content,direction,metadata) VALUES($1,$2,$3,'assistant',$4,'outbound',$5)`,[id('msg'),req.auth.tenant.id,conversationRow.id,result.text,JSON.stringify({intent:result.intent,confidence:result.confidence,citations:result.citations,tools:result.tools,mode:result.mode})]);
+  const updated=await one(`UPDATE conversations SET summary=$1,requires_handoff=$2,handoff_reason=$3,updated_at=now() WHERE id=$4 RETURNING *`,[`Latest: ${text.slice(0,160)}`,result.requiresHandoff,result.handoffReason||null,conversationRow.id]);
+  res.json({conversation:await serialize.conversation(updated),reply:result});
+}));
+coreRouter.post('/handoffs/:id/resolve',asyncRoute(async(req,res)=>{
+  const row=await one(`UPDATE handoffs SET status='resolved',resolved_at=now() WHERE id=$1 AND tenant_id=$2 RETURNING *`,[req.params.id,req.auth.tenant.id]);
+  if(!row)throw new HttpError(404,'Handoff not found.');
+  await query(`UPDATE conversations SET requires_handoff=false,handoff_reason=NULL,updated_at=now() WHERE id=$1`,[row.conversation_id]);
+  res.json({handoff:row});
+}));
+
+coreRouter.put('/brand',requireRole('owner','admin'),asyncRoute(async(req,res)=>{
+  const row=await tenant(req);const brand={...row.brand,...req.body};
+  brand.name=cleanText(brand.name,80);brand.tagline=cleanText(brand.tagline,160);brand.supportEmail=normalizeEmail(brand.supportEmail);brand.domain=cleanText(brand.domain,300);brand.logoMark=cleanText(brand.logoMark,3).toUpperCase();
+  if(!/^#[0-9a-f]{6}$/i.test(brand.accent||''))brand.accent=row.brand.accent;
+  const updated=await one('UPDATE tenants SET brand=$1,updated_at=now() WHERE id=$2 RETURNING brand',[JSON.stringify(brand),row.id]);
+  await auditLog(req,'brand.updated','tenant',row.id);
+  res.json({brand:updated.brand});
+}));
+coreRouter.put('/settings',requireRole('owner','admin'),asyncRoute(async(req,res)=>{
+  const row=await tenant(req);const allowed=['timezone','simulationMode','defaultPlan','requireHumanApprovalForOutbound','recordingDisclosureEnabled','dataRetentionDays','appointmentDurationMinutes','appointmentBufferMinutes','allowedWidgetOrigins'];
+  const settings={...row.settings};for(const key of allowed)if(req.body[key]!==undefined)settings[key]=req.body[key];
+  if(settings.simulationMode===false&&!config.openai.apiKey)throw new HttpError(400,'OpenAI must be configured before live AI mode can be enabled.');
+  const updated=await one('UPDATE tenants SET settings=$1,updated_at=now() WHERE id=$2 RETURNING settings',[JSON.stringify(settings),row.id]);
+  await auditLog(req,'settings.updated','tenant',row.id);
+  res.json({settings:updated.settings});
+}));
+
+coreRouter.get('/integrations',asyncRoute(async(req,res)=>res.json({highLevel:await getHighLevelConfigSummary(req.auth.tenant.id),openAI:{configured:Boolean(config.openai.apiKey),model:config.openai.model},twilio:{configured:Boolean(config.twilio.authToken),phoneNumber:config.twilio.phoneNumber},stripe:{configured:stripeConfigured()}})));
+coreRouter.post('/integrations/openai/test',asyncRoute(async(req,res)=>{
+  if(!config.openai.apiKey)return res.json({connected:false,message:'OPENAI_API_KEY is not configured.'});
+  const agentRow=await one('SELECT id FROM agents WHERE tenant_id=$1 ORDER BY created_at LIMIT 1',[req.auth.tenant.id]);
+  if(!agentRow)return res.json({connected:false,message:'Create an agent before testing OpenAI.'});
+  const result=await runAgent({tenantId:req.auth.tenant.id,agentId:agentRow.id,message:'What are your business hours?',contactName:'Integration test',channel:'Test Console'});
+  res.json({connected:true,message:`OpenAI responded in ${result.mode} mode.`,result});
+}));
+coreRouter.post('/integrations/highlevel',requireRole('owner','admin'),asyncRoute(async(req,res)=>{
+  const result=await saveHighLevelConfig(req.auth.tenant.id,req.body);await auditLog(req,'integration.highlevel.saved','integration',result.id);res.json({integration:result});
+}));

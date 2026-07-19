@@ -1,0 +1,7 @@
+(function(){
+  const script=document.currentScript;const token=script?.dataset.agentToken;const origin=(script?.dataset.commandOrigin||new URL(script.src).origin).replace(/\/$/,'');if(!token)return;
+  const root=document.createElement('div');root.id='command-ai-widget-root';root.style.cssText='position:fixed;right:20px;bottom:20px;z-index:2147483000;font-family:system-ui,sans-serif';
+  const button=document.createElement('button');button.type='button';button.setAttribute('aria-label','Open AI assistant');button.textContent='AI';button.style.cssText='width:58px;height:58px;border:0;border-radius:50%;background:linear-gradient(145deg,#4f8cff,#6b5be8);color:white;font-weight:900;font-size:16px;box-shadow:0 14px 38px rgba(0,0,0,.3);cursor:pointer';
+  const frame=document.createElement('iframe');frame.title='AI assistant';frame.src=`${origin}/widget?token=${encodeURIComponent(token)}&origin=${encodeURIComponent(origin)}&parent=${encodeURIComponent(location.origin)}`;frame.allow='clipboard-write';frame.style.cssText='display:none;width:min(390px,calc(100vw - 24px));height:min(640px,calc(100vh - 100px));margin-bottom:12px;border:0;border-radius:22px;background:transparent;box-shadow:0 24px 70px rgba(0,0,0,.35)';
+  button.onclick=()=>{const open=frame.style.display!=='none';frame.style.display=open?'none':'block';button.textContent=open?'AI':'×';};root.append(frame,button);document.body.append(root);
+})();

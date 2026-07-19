@@ -1,0 +1,32 @@
+[
+  {
+    "target": "src/routes/core.js",
+    "parts": [
+      ".source/core-small-00.txt",
+      ".source/core-small-01.txt",
+      ".source/core-small-02.txt",
+      ".source/core-small-03.txt",
+      ".source/core-small-04.txt",
+      ".source/core-small-05.txt",
+      ".source/core-small-06.txt",
+      ".source/core-small-07.txt"
+    ]
+  },
+  {
+    "target": "public/app.js",
+    "parts": [
+      ".source/app-small-00.txt",
+      ".source/app-small-01.txt",
+      ".source/app-small-02.txt",
+      ".source/app-small-03.txt",
+      ".source/app-small-04.txt"
+    ]
+  },
+  {
+    "target": "public/styles.css",
+    "parts": [
+      ".source/styles-small-00.txt",
+      ".source/styles-small-01.txt"
+    ]
+  }
+]

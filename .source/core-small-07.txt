@@ -1,0 +1,4 @@
+coreRouter.post('/integrations/highlevel/test',asyncRoute(async(req,res)=>res.json(await testHighLevel(req.auth.tenant.id))));
+
+coreRouter.post('/billing/clients/:id/checkout',requireRole('owner','admin'),asyncRoute(async(req,res)=>res.json(await createClientCheckout({tenantId:req.auth.tenant.id,clientId:req.params.id,plan:req.body.plan}))));
+coreRouter.post('/billing/clients/:id/portal',requireRole('owner','admin'),asyncRoute(async(req,res)=>res.json(await createClientPortal({tenantId:req.auth.tenant.id,clientId:req.params.id}))));

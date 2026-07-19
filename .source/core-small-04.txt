@@ -1,0 +1,30 @@
+  if(!clientRow) throw new HttpError(400,'A valid client is required.');
+  const row=await one(`INSERT INTO agents(id,tenant_id,client_id,name,role,status,model,tone,objective,guardrails,greeting,handoff_number,channels,widget_token,settings)
+    VALUES($1,$2,$3,$4,$5,'Draft',$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,[id('agent'),req.auth.tenant.id,clientRow.id,cleanText(req.body.name||'Atlas',60),cleanText(req.body.role||'AI Receptionist',120),cleanText(req.body.model||config.openai.model,80),cleanText(req.body.tone||'Professional and helpful',300),cleanText(req.body.objective||'',1000),cleanText(req.body.guardrails||'',2000),cleanText(req.body.greeting||`Thank you for contacting ${clientRow.business_name}. How can I help?`,500),cleanText(req.body.handoffNumber||clientRow.phone,40),JSON.stringify(Array.isArray(req.body.channels)?req.body.channels:['Web Chat']),token(24),JSON.stringify(req.body.settings||{minimumConfidence:0.7,allowBooking:true,allowHandoff:true})]);
+  await auditLog(req,'agent.created','agent',row.id);
+  res.status(201).json({agent:serialize.agent(row)});
+}));
+coreRouter.patch('/agents/:id', asyncRoute(async(req,res)=>{
+  const current=await one('SELECT * FROM agents WHERE id=$1 AND tenant_id=$2',[req.params.id,req.auth.tenant.id]);
+  if(!current) throw new HttpError(404,'Agent not found.');
+  const row=await one(`UPDATE agents SET name=$1,role=$2,status=$3,model=$4,tone=$5,objective=$6,guardrails=$7,greeting=$8,handoff_number=$9,channels=$10,settings=$11,prompt_version=prompt_version+1,updated_at=now() WHERE id=$12 RETURNING *`,[
+    cleanText(req.body.name??current.name,60),cleanText(req.body.role??current.role,120),cleanText(req.body.status??current.status,30),cleanText(req.body.model??current.model,80),cleanText(req.body.tone??current.tone,300),cleanText(req.body.objective??current.objective,1000),cleanText(req.body.guardrails??current.guardrails,2000),cleanText(req.body.greeting??current.greeting,500),cleanText(req.body.handoffNumber??current.handoff_number,40),JSON.stringify(req.body.channels??current.channels),JSON.stringify(req.body.settings??current.settings),current.id]);
+  await auditLog(req,'agent.updated','agent',row.id,{promptVersion:row.prompt_version});
+  res.json({agent:serialize.agent(row)});
+}));
+coreRouter.post('/agents/:id/test',agentRateLimit,asyncRoute(async(req,res)=>{
+  const result=await runAgent({tenantId:req.auth.tenant.id,agentId:req.params.id,message:req.body.message,contactName:req.body.contactName||'Test lead',channel:'Test Console'});
+  res.json({result});
+}));
+
+coreRouter.get('/knowledge',asyncRoute(async(req,res)=>{
+  const rows=await many(`SELECT kd.id,kd.client_id,kd.agent_id,kd.title,kd.source_type,kd.source_url,kd.status,kd.metadata,kd.created_at,kd.updated_at,count(kc.id)::int AS chunks FROM knowledge_documents kd LEFT JOIN knowledge_chunks kc ON kc.document_id=kd.id WHERE kd.tenant_id=$1 GROUP BY kd.id ORDER BY kd.updated_at DESC`,[req.auth.tenant.id]);
+  res.json({documents:rows.map(r=>({id:r.id,clientId:r.client_id,agentId:r.agent_id,title:r.title,sourceType:r.source_type,sourceUrl:r.source_url,status:r.status,metadata:r.metadata,chunks:r.chunks,createdAt:r.created_at,updatedAt:r.updated_at}))});
+}));
+coreRouter.post('/knowledge',asyncRoute(async(req,res)=>{
+  const clientRow=await one('SELECT id FROM clients WHERE id=$1 AND tenant_id=$2',[req.body.clientId,req.auth.tenant.id]);
+  if(!clientRow) throw new HttpError(400,'A valid client is required.');
+  const result=await createKnowledgeDocument({tenantId:req.auth.tenant.id,clientId:clientRow.id,agentId:req.body.agentId||null,title:req.body.title||'Knowledge document',content:req.body.content,sourceType:req.body.sourceType||'text',sourceUrl:req.body.sourceUrl||null});
+  await auditLog(req,'knowledge.created','knowledge_document',result.document.id,{chunks:result.chunkCount});
+  res.status(201).json({document:result.document,chunkCount:result.chunkCount,embedded:result.embedded});
+}));

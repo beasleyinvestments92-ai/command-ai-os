@@ -1,0 +1,42 @@
+(`UPDATE prospects SET score=$1,estimated_missed_revenue=$2,audit=$3,status=CASE WHEN status='New' THEN 'Qualified' ELSE status END,updated_at=now() WHERE id=$4 RETURNING *`, [score, estimated, JSON.stringify(signals), row.id]);
+  await auditLog(req, 'prospect.audited', 'prospect', row.id, { score, estimated });
+  res.json({ prospect: serialize.prospect(updated) });
+}));
+
+coreRouter.post('/prospects/:id/convert', asyncRoute(async (req, res) => {
+  const planPrices = { Receptionist: 297, Growth: 497, Operator: 797, 'Multi-location': 1297 };
+  const selectedPlan = planPrices[req.body.plan] ? req.body.plan : 'Growth';
+  const result = await tx(async (client) => {
+    const prospectResult = await client.query('SELECT * FROM prospects WHERE id=$1 AND tenant_id=$2 FOR UPDATE', [req.params.id, req.auth.tenant.id]);
+    const prospectRow = prospectResult.rows[0];
+    if (!prospectRow) return null;
+    const clientRow = await client.query(`INSERT INTO clients(id,tenant_id,business_name,industry,plan,monthly_price,status,launch_progress,phone,email,website,timezone,business_hours,emergency_rules)
+      VALUES($1,$2,$3,$4,$5,$6,'Onboarding',15,$7,$8,$9,$10,$11,$12) RETURNING *`, [
+      id('client'), req.auth.tenant.id, prospectRow.business_name, prospectRow.industry, selectedPlan, planPrices[selectedPlan], prospectRow.phone, prospectRow.email, prospectRow.website,
+      (await tenant(req)).settings?.timezone || 'America/Chicago', JSON.stringify({}), JSON.stringify([])
+    ]).then((r) => r.rows[0]);
+    await client.query(`UPDATE prospects SET status='Won',updated_at=now() WHERE id=$1`, [prospectRow.id]);
+    return clientRow;
+  });
+  if (!result) throw new HttpError(404, 'Prospect not found.');
+  await auditLog(req, 'prospect.converted', 'client', result.id, { prospectId: req.params.id });
+  res.status(201).json({ client: serialize.client(result) });
+}));
+
+const clientSchema = z.object({ businessName: z.string().min(1).max(120), industry: z.string().max(100).default('Local Service'), plan: z.string().max(40).default('Growth'), monthlyPrice: z.coerce.number().min(0).max(100000).default(497), phone: z.string().max(40).optional().default(''), email: z.string().max(320).optional().default(''), website: z.string().max(500).optional().default(''), timezone: z.string().max(80).default('America/Chicago') });
+
+coreRouter.get('/clients', asyncRoute(async (req, res) => res.json({ clients: (await many('SELECT * FROM clients WHERE tenant_id=$1 ORDER BY created_at DESC', [req.auth.tenant.id])).map(serialize.client) })));
+coreRouter.post('/clients', asyncRoute(async (req, res) => {
+  const body = parse(clientSchema, req.body);
+  const row = await one(`INSERT INTO clients(id,tenant_id,business_name,industry,plan,monthly_price,status,launch_progress,phone,email,website,timezone,business_hours,emergency_rules)
+    VALUES($1,$2,$3,$4,$5,$6,'Onboarding',10,$7,$8,$9,$10,$11,$12) RETURNING *`, [id('client'),req.auth.tenant.id,body.businessName,body.industry,body.plan,body.monthlyPrice,normalizePhone(body.phone),normalizeEmail(body.email),body.website,body.timezone,JSON.stringify(body.businessHours||{}),JSON.stringify(body.emergencyRules||[])]);
+  await auditLog(req,'client.created','client',row.id,{businessName:row.business_name});
+  res.status(201).json({client:serialize.client(row)});
+}));
+
+coreRouter.patch('/clients/:id', asyncRoute(async (req,res)=>{
+  const current=await one('SELECT * FROM clients WHERE id=$1 AND tenant_id=$2',[req.params.id,req.auth.tenant.id]);
+  if(!current) throw new HttpError(404,'Client not found.');
+  const data={
+    business_name: req.body.businessName ?? current.business_name, industry:req.body.industry ?? current.industry, plan:req.body.plan ?? current.plan,
+    monthly_price:req.body.monthlyPrice ?? current.monthly_price, status:req.body.status ?? current.status, launch_progress:req.body.launchProgress ?? current.launch_progress,

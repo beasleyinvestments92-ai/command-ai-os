@@ -1,0 +1,38 @@
+coreRouter.post('/knowledge/upload',upload.single('file'),asyncRoute(async(req,res)=>{
+  if(!req.file) throw new HttpError(400,'A file is required.');
+  const clientRow=await one('SELECT id FROM clients WHERE id=$1 AND tenant_id=$2',[req.body.clientId,req.auth.tenant.id]);
+  if(!clientRow) throw new HttpError(400,'A valid client is required.');
+  let content='';
+  const mime=req.file.mimetype;
+  if(mime==='application/pdf'||req.file.originalname.toLowerCase().endsWith('.pdf')) content=(await pdf(req.file.buffer)).text;
+  else if(mime.startsWith('text/')||/\.(txt|md|csv|json)$/i.test(req.file.originalname)) content=req.file.buffer.toString('utf8');
+  else throw new HttpError(415,'Only PDF, TXT, Markdown, CSV, and JSON files are supported.');
+  const result=await createKnowledgeDocument({tenantId:req.auth.tenant.id,clientId:clientRow.id,agentId:req.body.agentId||null,title:req.body.title||req.file.originalname,content,sourceType:'upload',metadata:{filename:req.file.originalname,mime,size:req.file.size}});
+  await auditLog(req,'knowledge.uploaded','knowledge_document',result.document.id,{filename:req.file.originalname,chunks:result.chunkCount});
+  res.status(201).json({document:result.document,chunkCount:result.chunkCount,embedded:result.embedded});
+}));
+coreRouter.delete('/knowledge/:id',requireRole('owner','admin'),asyncRoute(async(req,res)=>{
+  const result=await query('DELETE FROM knowledge_documents WHERE id=$1 AND tenant_id=$2',[req.params.id,req.auth.tenant.id]);
+  if(!result.rowCount) throw new HttpError(404,'Knowledge document not found.');
+  await auditLog(req,'knowledge.deleted','knowledge_document',req.params.id);
+  res.status(204).end();
+}));
+coreRouter.post('/knowledge/reindex/:clientId',asyncRoute(async(req,res)=>res.json(await reindexMissingEmbeddings({tenantId:req.auth.tenant.id,clientId:req.params.clientId}))));
+
+coreRouter.get('/conversations',asyncRoute(async(req,res)=>{
+  const rows=await many(`SELECT * FROM conversations WHERE tenant_id=$1 ORDER BY updated_at DESC LIMIT 100`,[req.auth.tenant.id]);
+  const output=[];for(const row of rows)output.push(await serialize.conversation(row));
+  res.json({conversations:output});
+}));
+coreRouter.post('/conversations',asyncRoute(async(req,res)=>{
+  const agentRow=await one('SELECT * FROM agents WHERE id=$1 AND tenant_id=$2',[req.body.agentId,req.auth.tenant.id]);
+  if(!agentRow) throw new HttpError(400,'A valid agent is required.');
+  const row=await one(`INSERT INTO conversations(id,tenant_id,client_id,agent_id,channel,status,summary,metadata) VALUES($1,$2,$3,$4,$5,'Open',$6,$7) RETURNING *`,[id('conv'),req.auth.tenant.id,agentRow.client_id,agentRow.id,cleanText(req.body.channel||'Web Chat',40),'New conversation',JSON.stringify({contactName:cleanText(req.body.contactName||'Website visitor',120)})]);
+  res.status(201).json({conversation:await serialize.conversation(row)});
+}));
+coreRouter.post('/conversations/:id/messages',agentRateLimit,asyncRoute(async(req,res)=>{
+  const conversationRow=await one('SELECT * FROM conversations WHERE id=$1 AND tenant_id=$2',[req.params.id,req.auth.tenant.id]);
+  if(!conversationRow) throw new HttpError(404,'Conversation not found.');
+  const text=cleanText(req.body.text,config.limits.agentMessageChars);if(!text)throw new HttpError(400,'Message is required.');
+  await query(`INSERT INTO messages(id,tenant_id,conversation_id,role,content,direction) VALUES($1,$2,$3,'user',$4,'inbound')`,[id('msg'),req.auth.tenant.id,conversationRow.id,text]);
+  const result=await runAgent({tenantId:req.auth.tenant.id,agentId:conversationRow.agent_id,conversationId:conversationRow.id,message:text,contactName:conversationRow.metadata?.contactName||'Customer',channel:conversationRow.channel});
